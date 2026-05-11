@@ -1,7 +1,6 @@
 """
 Controle de Produção / Estoque — versão web online
-Stack: Streamlit + Google Sheets (via gspread + google-auth)
-Deploy: Streamlit Community Cloud (gratuito, gera link público)
+Stack: Streamlit + Google Sheets (gspread + google-auth)
 """
 
 import streamlit as st
@@ -24,8 +23,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Usuários e senhas. Para gerar um hash novo:
-#   import hashlib; print(hashlib.sha256("senha".encode()).hexdigest())
 USUARIOS = {
     "admin": {
         "senha_hash": hashlib.sha256("admin123".encode()).hexdigest(),
@@ -35,7 +32,7 @@ USUARIOS = {
     "pagamento": {
         "senha_hash": hashlib.sha256("pag123".encode()).hexdigest(),
         "perfil": "admin_pagamento",
-        "nome": "Admin de Pagamento",
+        "nome": "Pagamento",
     },
 }
 
@@ -80,24 +77,19 @@ def garantir_tipos(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ==================================================
-# DIAGNÓSTICO DOS SECRETS
-# ==================================================
-
 def diagnostico_secrets():
     problemas = []
     if "connections" not in st.secrets or "gsheets" not in st.secrets.get("connections", {}):
         return [
             "A seção `[connections.gsheets]` está faltando nos Secrets.",
-            "Vá em **Settings → Secrets** do app no Streamlit Cloud e cole o bloco completo.",
+            "Vá em Settings → Secrets e cole o bloco completo.",
         ]
     cfg = st.secrets["connections"]["gsheets"]
     if "spreadsheet" not in cfg or not str(cfg.get("spreadsheet", "")).startswith("http"):
-        problemas.append("Falta `spreadsheet = \"https://...\"` na seção `[connections.gsheets]`.")
+        problemas.append("Falta `spreadsheet = \"https://...\"` em `[connections.gsheets]`.")
     if cfg.get("type") != "service_account":
-        problemas.append("Falta `type = \"service_account\"` na seção `[connections.gsheets]`.")
-    obrigatorios = ["project_id", "private_key_id", "private_key", "client_email", "client_id"]
-    for campo in obrigatorios:
+        problemas.append("Falta `type = \"service_account\"` em `[connections.gsheets]`.")
+    for campo in ("project_id", "private_key_id", "private_key", "client_email", "client_id"):
         if not cfg.get(campo):
             problemas.append(f"Falta o campo `{campo}` nos Secrets.")
     return problemas
@@ -109,40 +101,33 @@ def diagnostico_secrets():
 
 @st.cache_resource
 def get_gspread_client():
-    """Cria um cliente gspread autenticado via service account."""
     cfg = dict(st.secrets["connections"]["gsheets"])
-    # Remove campos que não são da credencial
     creds_dict = {k: v for k, v in cfg.items() if k not in ("spreadsheet", "worksheet")}
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
 def get_spreadsheet():
-    """Abre a planilha pela URL configurada nos secrets."""
     url = st.secrets["connections"]["gsheets"]["spreadsheet"]
-    client = get_gspread_client()
-    return client.open_by_url(url)
+    return get_gspread_client().open_by_url(url)
 
 
 def get_or_create_worksheet(nome: str, colunas: list):
-    """Retorna a worksheet pelo nome. Se não existir, cria com o cabeçalho."""
     sh = get_spreadsheet()
     try:
         ws = sh.worksheet(nome)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=nome, rows=100, cols=max(len(colunas), 10))
+        ws = sh.add_worksheet(title=nome, rows=200, cols=max(len(colunas), 10))
         ws.append_row(colunas)
     return ws
 
 
 def ler_worksheet(nome: str, colunas: list) -> pd.DataFrame:
-    """Lê uma worksheet inteira como DataFrame. Retorna vazio se não tiver dados."""
     ws = get_or_create_worksheet(nome, colunas)
-    registros = ws.get_all_records()  # lista de dicts (usa a 1ª linha como header)
+    registros = ws.get_all_records()
     if not registros:
         return pd.DataFrame(columns=colunas)
     df = pd.DataFrame(registros)
-    # Garante todas as colunas
     for c in colunas:
         if c not in df.columns:
             df[c] = ""
@@ -150,19 +135,15 @@ def ler_worksheet(nome: str, colunas: list) -> pd.DataFrame:
 
 
 def escrever_worksheet(nome: str, df: pd.DataFrame, colunas: list):
-    """Sobrescreve a worksheet com o conteúdo do DataFrame."""
     ws = get_or_create_worksheet(nome, colunas)
     ws.clear()
     valores = [colunas] + df[colunas].astype(str).values.tolist()
     ws.update(valores, value_input_option="USER_ENTERED")
 
 
-# Helpers de alto nível ----------------------------
-
 def carregar_estoque() -> pd.DataFrame:
     df = ler_worksheet(WORKSHEET_ESTOQUE, COLUNAS_ESTOQUE)
     if df.empty:
-        # Inicializa com a estrutura padrão
         return inicializar_estoque()
     return garantir_tipos(df)
 
@@ -172,8 +153,7 @@ def carregar_historico() -> pd.DataFrame:
 
 
 def salvar_estoque(df: pd.DataFrame):
-    df = garantir_tipos(df)
-    escrever_worksheet(WORKSHEET_ESTOQUE, df, COLUNAS_ESTOQUE)
+    escrever_worksheet(WORKSHEET_ESTOQUE, garantir_tipos(df), COLUNAS_ESTOQUE)
 
 
 def salvar_historico(df: pd.DataFrame):
@@ -196,8 +176,7 @@ def inicializar_estoque() -> pd.DataFrame:
 
 def registrar_no_historico(linhas):
     hist = carregar_historico()
-    novas = pd.DataFrame(linhas)
-    hist = pd.concat([hist, novas], ignore_index=True)
+    hist = pd.concat([hist, pd.DataFrame(linhas)], ignore_index=True)
     salvar_historico(hist)
 
 
@@ -215,7 +194,6 @@ def gerar_xlsx_fechamento() -> bytes:
         Pago_Total=("Pago", "sum"),
     ).reset_index()
     resumo["Diferenca"] = resumo["Real_Total"] - resumo["Meta_Total"]
-
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         estoque.to_excel(writer, sheet_name="Estoque_Final", index=False)
@@ -235,6 +213,23 @@ def fechar_semana_reset():
 
 
 # ==================================================
+# CSS (deixa mais denso, parecido com tkinter)
+# ==================================================
+
+CSS = """
+<style>
+.block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1400px; }
+[data-testid="stMetricLabel"] { font-size: 0.85rem; }
+[data-testid="stMetricValue"] { font-size: 1.4rem; }
+div[data-testid="stHorizontalBlock"] { gap: 1rem; }
+.painel-direita { background: #ffffff08; padding: 1rem; border-radius: 6px; border: 1px solid #ffffff15; }
+h1, h2, h3 { margin-top: 0.5rem !important; margin-bottom: 0.5rem !important; }
+.stButton button { width: 100%; }
+</style>
+"""
+
+
+# ==================================================
 # LOGIN
 # ==================================================
 
@@ -248,8 +243,8 @@ def autenticar(usuario: str, senha: str):
 
 
 def tela_login():
-    st.markdown("## 🔒 Controle de Produção")
-    st.caption("Faça login para continuar")
+    st.markdown("## Controle de Produção / Estoque")
+    st.write("Faça login para continuar.")
     with st.form("login_form"):
         usuario = st.text_input("Usuário")
         senha = st.text_input("Senha", type="password")
@@ -260,239 +255,210 @@ def tela_login():
             st.error("Usuário ou senha inválidos.")
         else:
             st.session_state.update({
-                "logado": True,
-                "usuario": usuario.strip(),
-                "perfil": info["perfil"],
-                "nome": info["nome"],
+                "logado": True, "usuario": usuario.strip(),
+                "perfil": info["perfil"], "nome": info["nome"],
             })
             st.rerun()
 
 
 # ==================================================
-# TELA — ADMIN DE PAGAMENTO (perfil restrito)
+# HEADER (igual nas duas telas)
 # ==================================================
 
-def tela_admin_pagamento():
-    st.markdown("### 💰 Pagamento de itens em débito")
-    st.caption(f"Logado como **{st.session_state['nome']}**")
+def header(df: pd.DataFrame, subtitulo: str = ""):
+    col_t, col_u = st.columns([4, 1])
+    with col_t:
+        st.markdown("## Controle de Produção / Estoque")
+        if subtitulo:
+            st.caption(subtitulo)
+    with col_u:
+        st.write("")
+        c1, c2 = st.columns([2, 1])
+        c1.markdown(f"**{st.session_state['nome']}**")
+        if c2.button("Sair", key="btn_sair"):
+            for k in ("logado", "usuario", "perfil", "nome"):
+                st.session_state.pop(k, None)
+            st.rerun()
 
-    df = carregar_estoque()
-    df["Faltando"] = df["Meta"] - df["Real"]
-    em_debito = df[df["Faltando"] > 0].copy().sort_values(
-        ["Conjunto", "Faltando"], ascending=[True, False]
-    )
-
-    if em_debito.empty:
-        st.success("🎉 Nada em débito. Todos os itens estão dentro da meta.")
-        return
-
-    col1, col2 = st.columns(2)
-    col1.metric("Itens em débito", len(em_debito))
-    col2.metric("Total de peças faltando", int(em_debito["Faltando"].sum()))
-
-    st.divider()
-    st.markdown("#### Itens em débito")
-    st.dataframe(
-        em_debito[["Conjunto", "Item", "Meta", "Real", "Faltando"]],
-        use_container_width=True, hide_index=True,
-    )
-
-    st.divider()
-    st.markdown("#### Lançar pagamento")
-    st.caption("Cada pagamento incrementa **Pago** e **Real** simultaneamente.")
-
-    with st.form("form_pagamento"):
-        conjuntos = sorted(em_debito["Conjunto"].unique().tolist())
-        conjunto = st.selectbox("Conjunto", conjuntos)
-        itens = em_debito[em_debito["Conjunto"] == conjunto]["Item"].tolist()
-        item = st.selectbox("Item", itens)
-        faltando_item = int(em_debito[
-            (em_debito["Conjunto"] == conjunto) & (em_debito["Item"] == item)
-        ]["Faltando"].iloc[0]) if itens else 0
-        st.info(f"Faltam **{faltando_item}** peças para este item.")
-        valor = st.number_input(
-            "Quantidade paga agora",
-            min_value=1, max_value=99999, value=min(faltando_item, 1) or 1, step=1,
-        )
-        enviar = st.form_submit_button("💰 Lançar pagamento", type="primary")
-
-    if enviar:
-        df_full = carregar_estoque()
-        mask = (df_full["Conjunto"] == conjunto) & (df_full["Item"] == item)
-        if not mask.any():
-            st.error("Item não encontrado.")
-            return
-        idx = df_full[mask].index[0]
-        df_full.at[idx, "Pago"] = int(df_full.at[idx, "Pago"]) + int(valor)
-        df_full.at[idx, "Real"] = int(df_full.at[idx, "Real"]) + int(valor)
-        df_full.at[idx, "Status"] = calcular_status(
-            int(df_full.at[idx, "Meta"]), int(df_full.at[idx, "Real"])
-        )
-        salvar_estoque(df_full)
-        registrar_no_historico([{
-            "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "Conjunto": conjunto, "Item": item,
-            "Tipo": "PAGO", "Valor": int(valor),
-            "Usuario": st.session_state["usuario"],
-        }])
-        st.success(f"Pagamento de {valor} unidade(s) lançado em '{item}'.")
-        st.rerun()
+    # Dashboard horizontal
+    total_itens = len(df)
+    total_meta = int(df["Meta"].sum()) if not df.empty else 0
+    total_real = int(df["Real"].sum()) if not df.empty else 0
+    diff = total_real - total_meta
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Itens", total_itens)
+    c2.metric("Meta Total", total_meta)
+    c3.metric("Produzido", total_real)
+    c4.metric("Diferença", diff)
 
 
 # ==================================================
-# TELA — ADMIN COMPLETO
+# TELA ADMIN COMPLETO
 # ==================================================
 
 def tela_admin_completo():
-    st.caption(f"Logado como **{st.session_state['nome']}** (acesso total)")
+    df = carregar_estoque()
+    header(df)
 
-    aba1, aba2, aba3, aba4 = st.tabs([
-        "📊 Estoque",
-        "➕ Adicionar / Remover",
-        "📜 Histórico",
-        "🗓️ Fechar Semana",
-    ])
+    # Busca
+    busca = st.text_input("Buscar item", "", placeholder="Digite parte do nome...")
 
-    with aba1:
-        df = carregar_estoque()
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Itens", len(df))
-        col2.metric("Meta total", int(df["Meta"].sum()))
-        col3.metric("Produzido", int(df["Real"].sum()))
-        col4.metric("Diferença", int(df["Real"].sum() - df["Meta"].sum()))
+    df_view = df.copy()
+    if busca.strip():
+        df_view = df_view[df_view["Item"].str.lower().str.contains(busca.lower())]
 
-        st.divider()
-        busca = st.text_input("🔎 Buscar item", "")
-        df_view = df.copy()
-        if busca.strip():
-            df_view = df_view[df_view["Item"].str.lower().str.contains(busca.lower())]
+    # Layout principal: esquerda (lista) | direita (controles)
+    col_esq, col_dir = st.columns([2, 1])
 
-        st.markdown("##### Edite os valores e clique em **Salvar alterações**")
-        editado = st.data_editor(
-            df_view,
+    # ----- ESQUERDA: lista de itens -----
+    with col_esq:
+        st.markdown("##### Itens")
+        st.caption("Clique numa linha para selecionar.")
+        df_show = df_view.copy()
+        # ordena por conjunto + item pra ficar agrupado visualmente
+        df_show = df_show.sort_values(["Conjunto", "Item"]).reset_index(drop=True)
+        evento = st.dataframe(
+            df_show,
             use_container_width=True, hide_index=True,
-            disabled=["Conjunto", "Item", "Status"],
+            on_select="rerun", selection_mode="single-row",
             column_config={
-                "Meta": st.column_config.NumberColumn(min_value=0, step=1),
-                "Real": st.column_config.NumberColumn(min_value=0, step=1),
-                "Pago": st.column_config.NumberColumn(min_value=0, step=1),
+                "Conjunto": st.column_config.TextColumn(width="medium"),
+                "Item": st.column_config.TextColumn(width="medium"),
+                "Meta": st.column_config.NumberColumn(width="small"),
+                "Real": st.column_config.NumberColumn(width="small"),
+                "Pago": st.column_config.NumberColumn(width="small"),
+                "Status": st.column_config.TextColumn(width="small"),
             },
-            key="editor_estoque",
+            key="tab_estoque",
+            height=520,
         )
 
-        if st.button("💾 Salvar alterações", type="primary"):
-            mudancas = 0
-            novas_linhas_hist = []
-            for _, row in editado.iterrows():
-                mask = (df["Conjunto"] == row["Conjunto"]) & (df["Item"] == row["Item"])
-                if not mask.any():
-                    continue
-                idx = df[mask].index[0]
-                for campo in ("Meta", "Real", "Pago"):
-                    novo = int(row[campo])
-                    antigo = int(df.at[idx, campo])
+        linhas_selecionadas = evento.selection.rows if evento and evento.selection else []
+        item_sel = None
+        if linhas_selecionadas:
+            row = df_show.iloc[linhas_selecionadas[0]]
+            item_sel = (row["Conjunto"], row["Item"])
+
+    # ----- DIREITA: controles -----
+    with col_dir:
+        if item_sel is None:
+            st.markdown("##### Selecionado")
+            st.info("Nenhum item selecionado. Clique numa linha da tabela ao lado.")
+        else:
+            conjunto, item_nome = item_sel
+            linha_atual = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].iloc[0]
+
+            st.markdown(f"##### {item_nome}")
+            st.caption(f"{conjunto}  ·  Status: **{linha_atual['Status']}**")
+
+            with st.form("form_edit", clear_on_submit=False):
+                meta = st.number_input("Meta", min_value=0, value=int(linha_atual["Meta"]), step=1)
+                real = st.number_input("Real", min_value=0, value=int(linha_atual["Real"]), step=1)
+                pago = st.number_input("Pago", min_value=0, value=int(linha_atual["Pago"]), step=1)
+                col_b1, col_b2 = st.columns(2)
+                atualizar = col_b1.form_submit_button("Atualizar", type="primary")
+                zerar_pago = col_b2.form_submit_button("Zerar Pago")
+
+            if atualizar:
+                idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
+                novas_hist = []
+                for campo, novo, antigo in [
+                    ("Meta", meta, int(linha_atual["Meta"])),
+                    ("Real", real, int(linha_atual["Real"])),
+                    ("Pago", pago, int(linha_atual["Pago"])),
+                ]:
                     if novo != antigo:
                         df.at[idx, campo] = novo
-                        mudancas += 1
-                        novas_linhas_hist.append({
+                        novas_hist.append({
                             "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                            "Conjunto": row["Conjunto"], "Item": row["Item"],
+                            "Conjunto": conjunto, "Item": item_nome,
                             "Tipo": campo.upper(), "Valor": novo - antigo,
                             "Usuario": st.session_state["usuario"],
                         })
-                df.at[idx, "Status"] = calcular_status(
-                    int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
-                )
-            salvar_estoque(df)
-            if novas_linhas_hist:
-                registrar_no_historico(novas_linhas_hist)
-            st.success(f"{mudancas} alteração(ões) salvas.")
-            st.rerun()
+                df.at[idx, "Status"] = calcular_status(int(df.at[idx, "Meta"]), int(df.at[idx, "Real"]))
+                salvar_estoque(df)
+                if novas_hist:
+                    registrar_no_historico(novas_hist)
+                st.success("Atualizado.")
+                st.rerun()
 
-    with aba2:
-        df = carregar_estoque()
-        col_a, col_b = st.columns(2)
+            if zerar_pago:
+                idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
+                df.at[idx, "Pago"] = 0
+                salvar_estoque(df)
+                registrar_no_historico([{
+                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Conjunto": conjunto, "Item": item_nome,
+                    "Tipo": "ZERAR_PAGO", "Valor": 0,
+                    "Usuario": st.session_state["usuario"],
+                }])
+                st.rerun()
 
-        with col_a:
-            st.markdown("##### ➕ Adicionar item")
-            with st.form("form_add"):
-                conjuntos_existentes = sorted(df["Conjunto"].unique().tolist())
-                opcoes = conjuntos_existentes + ["⊕ Criar novo conjunto"]
-                conjunto_escolhido = st.selectbox("Conjunto", opcoes)
-                if conjunto_escolhido == "⊕ Criar novo conjunto":
-                    conjunto_final = st.text_input("Nome do novo conjunto").strip()
-                else:
-                    conjunto_final = conjunto_escolhido
-                novo_item = st.text_input("Nome do item").strip()
-                meta_inicial = st.number_input("Meta inicial", min_value=0, value=0, step=1)
-                adicionar = st.form_submit_button("Adicionar", type="primary")
+            st.write("")
+            confirmar_excluir = st.checkbox("Confirmo excluir este item")
+            if st.button("Excluir Item", type="secondary", disabled=not confirmar_excluir):
+                df = df[~((df["Conjunto"] == conjunto) & (df["Item"] == item_nome))]
+                salvar_estoque(df)
+                registrar_no_historico([{
+                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Conjunto": conjunto, "Item": item_nome,
+                    "Tipo": "REMOVE_ITEM", "Valor": "-",
+                    "Usuario": st.session_state["usuario"],
+                }])
+                st.rerun()
 
-            if adicionar:
-                if not conjunto_final or not novo_item:
-                    st.error("Preencha conjunto e item.")
-                elif ((df["Conjunto"] == conjunto_final) & (df["Item"] == novo_item)).any():
-                    st.error(f"Já existe '{novo_item}' em '{conjunto_final}'.")
-                else:
-                    nova = pd.DataFrame([{
-                        "Conjunto": conjunto_final, "Item": novo_item,
-                        "Meta": int(meta_inicial), "Real": 0, "Pago": 0,
-                        "Status": calcular_status(int(meta_inicial), 0),
-                    }])
-                    df = pd.concat([df, nova], ignore_index=True)
-                    salvar_estoque(df)
-                    registrar_no_historico([{
-                        "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                        "Conjunto": conjunto_final, "Item": novo_item,
-                        "Tipo": "ADD_ITEM", "Valor": int(meta_inicial),
-                        "Usuario": st.session_state["usuario"],
-                    }])
-                    st.success(f"'{novo_item}' adicionado em '{conjunto_final}'.")
-                    st.rerun()
+    # ----- RODAPÉ: ações secundárias em expanders -----
+    st.divider()
 
-        with col_b:
-            st.markdown("##### 🗑️ Remover item")
-            with st.form("form_remove"):
-                conjunto_rm = st.selectbox(
-                    "Conjunto", sorted(df["Conjunto"].unique().tolist()), key="rm_conj",
-                )
-                itens_disponiveis = df[df["Conjunto"] == conjunto_rm]["Item"].tolist()
-                item_rm = st.selectbox("Item", itens_disponiveis, key="rm_item")
-                confirmar = st.checkbox("Confirmo a remoção")
-                remover = st.form_submit_button("Remover", type="secondary")
+    with st.expander("Adicionar item"):
+        with st.form("form_add"):
+            conjuntos_existentes = sorted(df["Conjunto"].unique().tolist())
+            opcoes = conjuntos_existentes + ["+ Criar novo conjunto"]
+            c1, c2, c3 = st.columns([2, 2, 1])
+            conjunto_escolhido = c1.selectbox("Conjunto", opcoes)
+            if conjunto_escolhido == "+ Criar novo conjunto":
+                conjunto_final = c1.text_input("Nome do novo conjunto").strip()
+            else:
+                conjunto_final = conjunto_escolhido
+            novo_item = c2.text_input("Nome do item").strip()
+            meta_inicial = c3.number_input("Meta inicial", min_value=0, value=0, step=1)
+            adicionar = st.form_submit_button("Adicionar", type="primary")
 
-            if remover:
-                if not confirmar:
-                    st.warning("Marque a confirmação antes de remover.")
-                else:
-                    df = df[~((df["Conjunto"] == conjunto_rm) & (df["Item"] == item_rm))]
-                    salvar_estoque(df)
-                    registrar_no_historico([{
-                        "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                        "Conjunto": conjunto_rm, "Item": item_rm,
-                        "Tipo": "REMOVE_ITEM", "Valor": "-",
-                        "Usuario": st.session_state["usuario"],
-                    }])
-                    st.success(f"'{item_rm}' removido de '{conjunto_rm}'.")
-                    st.rerun()
+        if adicionar:
+            if not conjunto_final or not novo_item:
+                st.error("Preencha conjunto e item.")
+            elif ((df["Conjunto"] == conjunto_final) & (df["Item"] == novo_item)).any():
+                st.error(f"Já existe '{novo_item}' em '{conjunto_final}'.")
+            else:
+                nova = pd.DataFrame([{
+                    "Conjunto": conjunto_final, "Item": novo_item,
+                    "Meta": int(meta_inicial), "Real": 0, "Pago": 0,
+                    "Status": calcular_status(int(meta_inicial), 0),
+                }])
+                df = pd.concat([df, nova], ignore_index=True)
+                salvar_estoque(df)
+                registrar_no_historico([{
+                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Conjunto": conjunto_final, "Item": novo_item,
+                    "Tipo": "ADD_ITEM", "Valor": int(meta_inicial),
+                    "Usuario": st.session_state["usuario"],
+                }])
+                st.success(f"'{novo_item}' adicionado.")
+                st.rerun()
 
-    with aba3:
+    with st.expander("Histórico"):
         hist = carregar_historico()
         if hist.empty:
-            st.info("Sem movimentações registradas ainda.")
+            st.write("Sem movimentações registradas.")
         else:
-            st.dataframe(hist.iloc[::-1], use_container_width=True, hide_index=True)
+            st.dataframe(hist.iloc[::-1], use_container_width=True, hide_index=True, height=300)
 
-    with aba4:
-        st.markdown("##### 🗓️ Fechar a semana")
-        st.warning(
-            "Esta ação vai:\n\n"
-            "1. **Gerar um arquivo `.xlsx`** com Estoque Final, Histórico e Resumo\n"
-            "2. **Zerar** Meta, Real e Pago (mantendo conjuntos/itens)\n"
-            "3. **Limpar** o histórico"
+    with st.expander("Fechar Semana"):
+        st.write(
+            "Baixe a planilha da semana, depois zere os valores para começar a próxima "
+            "(Meta, Real e Pago voltam a zero; histórico é limpo)."
         )
-
-        with st.expander("👁️ Pré-visualizar resumo"):
-            df = carregar_estoque()
+        with st.popover("Pré-visualizar resumo"):
             resumo = df.groupby("Conjunto").agg(
                 Itens=("Item", "count"),
                 Meta=("Meta", "sum"),
@@ -502,21 +468,100 @@ def tela_admin_completo():
             resumo["Diferenca"] = resumo["Real"] - resumo["Meta"]
             st.dataframe(resumo, use_container_width=True, hide_index=True)
 
-        st.markdown("**Passo 1 — Baixe o arquivo da semana:**")
         ts = datetime.now().strftime("%Y-%m-%d_%Hh%M")
-        st.download_button(
-            "⬇️ Baixar planilha da semana (.xlsx)",
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            "Baixar planilha da semana (.xlsx)",
             data=gerar_xlsx_fechamento(),
             file_name=f"fechamento_semana_{ts}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
-
-        st.markdown("**Passo 2 — Depois de baixar, zere a planilha:**")
-        confirmar = st.checkbox("Já baixei e confirmo que quero zerar a planilha")
-        if st.button("🔒 Zerar planilha e iniciar nova semana", disabled=not confirmar):
+        confirmar = c2.checkbox("Já baixei, quero zerar")
+        if st.button("Zerar planilha e iniciar nova semana", disabled=not confirmar):
             fechar_semana_reset()
-            st.success("Planilha zerada. Boa nova semana!")
+            st.success("Planilha zerada.")
             st.rerun()
+
+
+# ==================================================
+# TELA ADMIN DE PAGAMENTO
+# ==================================================
+
+def tela_admin_pagamento():
+    df = carregar_estoque()
+    df["Faltando"] = df["Meta"] - df["Real"]
+    em_debito = df[df["Faltando"] > 0].copy()
+
+    header(df, subtitulo="Pagamento de itens em débito")
+
+    if em_debito.empty:
+        st.success("Nada em débito. Todos os itens estão dentro da meta.")
+        return
+
+    total_em_debito = int(em_debito["Faltando"].sum())
+    st.caption(f"**{len(em_debito)}** itens em débito · **{total_em_debito}** peças faltando no total")
+
+    col_esq, col_dir = st.columns([2, 1])
+
+    with col_esq:
+        st.markdown("##### Itens em débito")
+        df_show = em_debito[["Conjunto", "Item", "Meta", "Real", "Faltando"]].sort_values(
+            ["Conjunto", "Faltando"], ascending=[True, False]
+        ).reset_index(drop=True)
+
+        evento = st.dataframe(
+            df_show,
+            use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row",
+            key="tab_debito",
+            height=520,
+        )
+        linhas = evento.selection.rows if evento and evento.selection else []
+        item_sel = None
+        if linhas:
+            row = df_show.iloc[linhas[0]]
+            item_sel = (row["Conjunto"], row["Item"])
+
+    with col_dir:
+        if item_sel is None:
+            st.markdown("##### Lançar pagamento")
+            st.info("Selecione um item na tabela ao lado para lançar pagamento.")
+        else:
+            conjunto, item_nome = item_sel
+            linha = em_debito[
+                (em_debito["Conjunto"] == conjunto) & (em_debito["Item"] == item_nome)
+            ].iloc[0]
+            faltando = int(linha["Faltando"])
+
+            st.markdown(f"##### {item_nome}")
+            st.caption(f"{conjunto}  ·  Faltam: **{faltando}**")
+
+            with st.form("form_pag"):
+                valor = st.number_input(
+                    "Quantidade paga agora",
+                    min_value=1, max_value=99999, value=min(faltando, 1) or 1, step=1,
+                )
+                enviar = st.form_submit_button("Lançar pagamento", type="primary")
+
+            if enviar:
+                idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
+                df.at[idx, "Pago"] = int(df.at[idx, "Pago"]) + int(valor)
+                df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor)
+                df.at[idx, "Status"] = calcular_status(
+                    int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
+                )
+                # remove a coluna "Faltando" antes de salvar
+                df_save = df.drop(columns=["Faltando"], errors="ignore")
+                salvar_estoque(df_save)
+                registrar_no_historico([{
+                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Conjunto": conjunto, "Item": item_nome,
+                    "Tipo": "PAGO", "Valor": int(valor),
+                    "Usuario": st.session_state["usuario"],
+                }])
+                st.success(f"Pagamento de {valor} unidade(s) lançado.")
+                st.rerun()
 
 
 # ==================================================
@@ -525,14 +570,15 @@ def tela_admin_completo():
 
 def main():
     st.set_page_config(
-        page_title="Controle de Produção — Bump",
+        page_title="Controle de Produção",
         page_icon="🔧",
         layout="wide",
     )
+    st.markdown(CSS, unsafe_allow_html=True)
 
     problemas = diagnostico_secrets()
     if problemas:
-        st.error("⚠️ Configuração incompleta nos Secrets do Streamlit Cloud:")
+        st.error("Configuração incompleta nos Secrets do Streamlit Cloud:")
         for p in problemas:
             st.markdown(f"- {p}")
         return
@@ -543,15 +589,6 @@ def main():
     if not st.session_state["logado"]:
         tela_login()
         return
-
-    st.markdown("# 🔧 Controle de Produção")
-    with st.sidebar:
-        st.markdown(f"**Usuário:** {st.session_state['nome']}")
-        st.markdown(f"**Perfil:** `{st.session_state['perfil']}`")
-        if st.button("🚪 Sair"):
-            for k in ("logado", "usuario", "perfil", "nome"):
-                st.session_state.pop(k, None)
-            st.rerun()
 
     perfil = st.session_state["perfil"]
     if perfil == "admin_completo":
