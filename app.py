@@ -1,15 +1,16 @@
 """
 Controle de Produção / Estoque — versão web online
-Stack: Streamlit + Google Sheets (via st-gsheets-connection)
+Stack: Streamlit + Google Sheets (via gspread + google-auth)
 Deploy: Streamlit Community Cloud (gratuito, gera link público)
 """
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from streamlit_gsheets import GSheetsConnection
 import hashlib
 import io
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ==================================================
 # CONFIGURAÇÃO
@@ -17,6 +18,11 @@ import io
 
 WORKSHEET_ESTOQUE = "Estoque"
 WORKSHEET_HISTORICO = "Historico"
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 # Usuários e senhas. Para gerar um hash novo:
 #   import hashlib; print(hashlib.sha256("senha".encode()).hexdigest())
@@ -75,106 +81,106 @@ def garantir_tipos(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==================================================
-# GOOGLE SHEETS — leitura e escrita
+# DIAGNÓSTICO DOS SECRETS
 # ==================================================
 
-@st.cache_resource
-def get_connection():
-    return st.connection("gsheets", type=GSheetsConnection)
-
-
-def get_spreadsheet_url():
-    """Lê a URL da planilha dos secrets para passar explicitamente em cada chamada.
-    Isso contorna um bug conhecido do streamlit-gsheets no Streamlit Cloud."""
-    return st.secrets["connections"]["gsheets"]["spreadsheet"]
-
-
 def diagnostico_secrets():
-    """Verifica se os secrets estão configurados como Service Account com CRUD."""
     problemas = []
-
     if "connections" not in st.secrets or "gsheets" not in st.secrets.get("connections", {}):
         return [
             "A seção `[connections.gsheets]` está faltando nos Secrets.",
-            "Vá em **Settings → Secrets** do app no Streamlit Cloud e cole o bloco completo "
-            "(veja o README do projeto).",
+            "Vá em **Settings → Secrets** do app no Streamlit Cloud e cole o bloco completo.",
         ]
-
     cfg = st.secrets["connections"]["gsheets"]
-
     if "spreadsheet" not in cfg or not str(cfg.get("spreadsheet", "")).startswith("http"):
-        problemas.append(
-            "Falta `spreadsheet = \"https://docs.google.com/spreadsheets/d/.../edit\"` "
-            "na seção `[connections.gsheets]`."
-        )
-
+        problemas.append("Falta `spreadsheet = \"https://...\"` na seção `[connections.gsheets]`.")
     if cfg.get("type") != "service_account":
-        problemas.append(
-            "Falta `type = \"service_account\"` na seção `[connections.gsheets]`. "
-            "Sem isso, o conector entra em modo só-leitura e dá erro ao salvar."
-        )
-
-    obrigatorios = [
-        "project_id", "private_key_id", "private_key",
-        "client_email", "client_id",
-    ]
+        problemas.append("Falta `type = \"service_account\"` na seção `[connections.gsheets]`.")
+    obrigatorios = ["project_id", "private_key_id", "private_key", "client_email", "client_id"]
     for campo in obrigatorios:
         if not cfg.get(campo):
             problemas.append(f"Falta o campo `{campo}` nos Secrets.")
-
     return problemas
 
 
-def carregar_estoque() -> pd.DataFrame:
-    conn = get_connection()
-    url = get_spreadsheet_url()
+# ==================================================
+# GOOGLE SHEETS — via gspread
+# ==================================================
+
+@st.cache_resource
+def get_gspread_client():
+    """Cria um cliente gspread autenticado via service account."""
+    cfg = dict(st.secrets["connections"]["gsheets"])
+    # Remove campos que não são da credencial
+    creds_dict = {k: v for k, v in cfg.items() if k not in ("spreadsheet", "worksheet")}
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+def get_spreadsheet():
+    """Abre a planilha pela URL configurada nos secrets."""
+    url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+    client = get_gspread_client()
+    return client.open_by_url(url)
+
+
+def get_or_create_worksheet(nome: str, colunas: list):
+    """Retorna a worksheet pelo nome. Se não existir, cria com o cabeçalho."""
+    sh = get_spreadsheet()
     try:
-        df = conn.read(spreadsheet=url, worksheet=WORKSHEET_ESTOQUE, ttl=0)
-        df = df.dropna(how="all")
-        if df.empty or not all(c in df.columns for c in COLUNAS_ESTOQUE):
-            return inicializar_planilha()
-        return garantir_tipos(df[COLUNAS_ESTOQUE])
-    except Exception as e:
-        st.warning(f"Inicializando planilha (motivo: {e})")
-        return inicializar_planilha()
+        ws = sh.worksheet(nome)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=nome, rows=100, cols=max(len(colunas), 10))
+        ws.append_row(colunas)
+    return ws
+
+
+def ler_worksheet(nome: str, colunas: list) -> pd.DataFrame:
+    """Lê uma worksheet inteira como DataFrame. Retorna vazio se não tiver dados."""
+    ws = get_or_create_worksheet(nome, colunas)
+    registros = ws.get_all_records()  # lista de dicts (usa a 1ª linha como header)
+    if not registros:
+        return pd.DataFrame(columns=colunas)
+    df = pd.DataFrame(registros)
+    # Garante todas as colunas
+    for c in colunas:
+        if c not in df.columns:
+            df[c] = ""
+    return df[colunas]
+
+
+def escrever_worksheet(nome: str, df: pd.DataFrame, colunas: list):
+    """Sobrescreve a worksheet com o conteúdo do DataFrame."""
+    ws = get_or_create_worksheet(nome, colunas)
+    ws.clear()
+    valores = [colunas] + df[colunas].astype(str).values.tolist()
+    ws.update(valores, value_input_option="USER_ENTERED")
+
+
+# Helpers de alto nível ----------------------------
+
+def carregar_estoque() -> pd.DataFrame:
+    df = ler_worksheet(WORKSHEET_ESTOQUE, COLUNAS_ESTOQUE)
+    if df.empty:
+        # Inicializa com a estrutura padrão
+        return inicializar_estoque()
+    return garantir_tipos(df)
 
 
 def carregar_historico() -> pd.DataFrame:
-    conn = get_connection()
-    url = get_spreadsheet_url()
-    try:
-        df = conn.read(spreadsheet=url, worksheet=WORKSHEET_HISTORICO, ttl=0)
-        df = df.dropna(how="all")
-        if df.empty:
-            return pd.DataFrame(columns=COLUNAS_HISTORICO)
-        for col in COLUNAS_HISTORICO:
-            if col not in df.columns:
-                df[col] = ""
-        return df[COLUNAS_HISTORICO]
-    except Exception:
-        return pd.DataFrame(columns=COLUNAS_HISTORICO)
+    return ler_worksheet(WORKSHEET_HISTORICO, COLUNAS_HISTORICO)
 
 
 def salvar_estoque(df: pd.DataFrame):
-    conn = get_connection()
-    url = get_spreadsheet_url()
     df = garantir_tipos(df)
-    conn.update(spreadsheet=url, worksheet=WORKSHEET_ESTOQUE, data=df[COLUNAS_ESTOQUE])
-    st.cache_data.clear()
+    escrever_worksheet(WORKSHEET_ESTOQUE, df, COLUNAS_ESTOQUE)
 
 
 def salvar_historico(df: pd.DataFrame):
-    conn = get_connection()
-    url = get_spreadsheet_url()
-    conn.update(spreadsheet=url, worksheet=WORKSHEET_HISTORICO, data=df[COLUNAS_HISTORICO])
-    st.cache_data.clear()
+    escrever_worksheet(WORKSHEET_HISTORICO, df, COLUNAS_HISTORICO)
 
 
-def inicializar_planilha() -> pd.DataFrame:
-    """Cria as worksheets Estoque e Historico com a estrutura padrão na primeira execução."""
-    conn = get_connection()
-    url = get_spreadsheet_url()
-
+def inicializar_estoque() -> pd.DataFrame:
     lista = []
     for conjunto, itens in DADOS_PADRAO.items():
         for item in itens:
@@ -182,25 +188,10 @@ def inicializar_planilha() -> pd.DataFrame:
                 "Conjunto": conjunto, "Item": item,
                 "Meta": 0, "Real": 0, "Pago": 0, "Status": "OK",
             })
-    df_estoque = pd.DataFrame(lista)
-    df_historico = pd.DataFrame(columns=COLUNAS_HISTORICO)
-
-    # Tenta update primeiro (worksheet existe); se falhar, tenta create.
-    for worksheet, data in [
-        (WORKSHEET_ESTOQUE, df_estoque),
-        (WORKSHEET_HISTORICO, df_historico),
-    ]:
-        try:
-            conn.update(spreadsheet=url, worksheet=worksheet, data=data)
-        except Exception:
-            try:
-                conn.create(spreadsheet=url, worksheet=worksheet, data=data)
-            except Exception as e:
-                st.error(f"Não consegui criar a worksheet '{worksheet}': {e}")
-                raise
-
-    st.cache_data.clear()
-    return df_estoque
+    df = pd.DataFrame(lista)
+    salvar_estoque(df)
+    salvar_historico(pd.DataFrame(columns=COLUNAS_HISTORICO))
+    return df
 
 
 def registrar_no_historico(linhas):
@@ -308,10 +299,7 @@ def tela_admin_pagamento():
 
     st.divider()
     st.markdown("#### Lançar pagamento")
-    st.caption(
-        "Cada pagamento incrementa **Pago** e **Real** simultaneamente "
-        "(mesma lógica do sistema original)."
-    )
+    st.caption("Cada pagamento incrementa **Pago** e **Real** simultaneamente.")
 
     with st.form("form_pagamento"):
         conjuntos = sorted(em_debito["Conjunto"].unique().tolist())
@@ -498,9 +486,8 @@ def tela_admin_completo():
         st.markdown("##### 🗓️ Fechar a semana")
         st.warning(
             "Esta ação vai:\n\n"
-            "1. **Gerar um arquivo `.xlsx`** com Estoque Final, Histórico e Resumo "
-            "(baixe e guarde no Drive)\n"
-            "2. **Zerar** Meta, Real e Pago de todos os itens (mantendo conjuntos/itens)\n"
+            "1. **Gerar um arquivo `.xlsx`** com Estoque Final, Histórico e Resumo\n"
+            "2. **Zerar** Meta, Real e Pago (mantendo conjuntos/itens)\n"
             "3. **Limpar** o histórico"
         )
 
@@ -543,29 +530,11 @@ def main():
         layout="wide",
     )
 
-    # Diagnóstico de configuração antes de qualquer coisa
     problemas = diagnostico_secrets()
     if problemas:
         st.error("⚠️ Configuração incompleta nos Secrets do Streamlit Cloud:")
         for p in problemas:
             st.markdown(f"- {p}")
-        st.divider()
-        st.markdown("**Estrutura esperada (Settings → Secrets):**")
-        st.code(
-            '[connections.gsheets]\n'
-            'spreadsheet = "https://docs.google.com/spreadsheets/d/SEU_ID/edit"\n'
-            'type = "service_account"\n'
-            'project_id = "..."\n'
-            'private_key_id = "..."\n'
-            'private_key = "-----BEGIN PRIVATE KEY-----\\nMIIEv...\\n-----END PRIVATE KEY-----\\n"\n'
-            'client_email = "...@....iam.gserviceaccount.com"\n'
-            'client_id = "..."\n'
-            'auth_uri = "https://accounts.google.com/o/oauth2/auth"\n'
-            'token_uri = "https://oauth2.googleapis.com/token"\n'
-            'auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"\n'
-            'client_x509_cert_url = "..."',
-            language="toml",
-        )
         return
 
     if "logado" not in st.session_state:
