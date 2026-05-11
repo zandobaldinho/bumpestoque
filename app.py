@@ -1,6 +1,11 @@
 """
 Controle de Produção / Estoque — versão web online
 Stack: Streamlit + Google Sheets (gspread + google-auth)
+
+Perfis:
+- admin_completo: vê tudo, edita inline e via painel, adiciona/remove, fecha semana
+- admin_pagamento: vê só itens em débito, lança pagamentos
+- visualizador: vê tudo em modo leitura, sem editar
 """
 
 import streamlit as st
@@ -23,16 +28,23 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# Hashes SHA-256 das senhas. Para gerar um novo hash:
+#   import hashlib; print(hashlib.sha256("senha".encode()).hexdigest())
 USUARIOS = {
-    "admin": {
-        "senha_hash": hashlib.sha256("admin123".encode()).hexdigest(),
+    "guilhermeadmin": {
+        "senha_hash": "8a5af9f2c0290c31a9042bc03598a6eb4db340163f4194797554e53c103712ef",
         "perfil": "admin_completo",
-        "nome": "Administrador",
+        "nome": "Guilherme",
     },
-    "pagamento": {
-        "senha_hash": hashlib.sha256("pag123".encode()).hexdigest(),
+    "abner": {
+        "senha_hash": "e19f85647a83be0aa7d9683d8590380928fd3b3be9fedb7dab507df86f2d6102",
         "perfil": "admin_pagamento",
-        "nome": "Pagamento",
+        "nome": "Abner",
+    },
+    "wagnerbender": {
+        "senha_hash": "7e5e2e43c4eb7ab30d26677b8b4132f4ca74d154439489db5a46b477681387f3",
+        "perfil": "visualizador",
+        "nome": "Wagner Bender",
     },
 }
 
@@ -75,6 +87,10 @@ def garantir_tipos(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
+
+
+def agora() -> str:
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
 
 
 def diagnostico_secrets():
@@ -213,18 +229,18 @@ def fechar_semana_reset():
 
 
 # ==================================================
-# CSS (deixa mais denso, parecido com tkinter)
+# CSS — visual mais denso/clean
 # ==================================================
 
 CSS = """
 <style>
-.block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1400px; }
-[data-testid="stMetricLabel"] { font-size: 0.85rem; }
-[data-testid="stMetricValue"] { font-size: 1.4rem; }
-div[data-testid="stHorizontalBlock"] { gap: 1rem; }
-.painel-direita { background: #ffffff08; padding: 1rem; border-radius: 6px; border: 1px solid #ffffff15; }
-h1, h2, h3 { margin-top: 0.5rem !important; margin-bottom: 0.5rem !important; }
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px; }
+[data-testid="stMetricLabel"] { font-size: 0.8rem; }
+[data-testid="stMetricValue"] { font-size: 1.3rem; }
+div[data-testid="stHorizontalBlock"] { gap: 0.8rem; }
+h1, h2, h3 { margin-top: 0.4rem !important; margin-bottom: 0.4rem !important; }
 .stButton button { width: 100%; }
+[data-testid="stForm"] { border: 1px solid #ffffff15; padding: 1rem; border-radius: 6px; }
 </style>
 """
 
@@ -262,7 +278,7 @@ def tela_login():
 
 
 # ==================================================
-# HEADER (igual nas duas telas)
+# HEADER (igual em todas as telas)
 # ==================================================
 
 def header(df: pd.DataFrame, subtitulo: str = ""):
@@ -280,7 +296,6 @@ def header(df: pd.DataFrame, subtitulo: str = ""):
                 st.session_state.pop(k, None)
             st.rerun()
 
-    # Dashboard horizontal
     total_itens = len(df)
     total_meta = int(df["Meta"].sum()) if not df.empty else 0
     total_real = int(df["Real"].sum()) if not df.empty else 0
@@ -300,94 +315,113 @@ def tela_admin_completo():
     df = carregar_estoque()
     header(df)
 
-    # Busca
     busca = st.text_input("Buscar item", "", placeholder="Digite parte do nome...")
 
     df_view = df.copy()
     if busca.strip():
         df_view = df_view[df_view["Item"].str.lower().str.contains(busca.lower())]
 
-    # Layout principal: esquerda (lista) | direita (controles)
+    df_show = df_view.sort_values(["Conjunto", "Item"]).reset_index(drop=True)
+
     col_esq, col_dir = st.columns([2, 1])
 
-    # ----- ESQUERDA: lista de itens -----
+    # ----- ESQUERDA: tabela editável -----
     with col_esq:
-        st.markdown("##### Itens")
-        st.caption("Clique numa linha para selecionar.")
-        df_show = df_view.copy()
-        # ordena por conjunto + item pra ficar agrupado visualmente
-        df_show = df_show.sort_values(["Conjunto", "Item"]).reset_index(drop=True)
-        evento = st.dataframe(
+        st.markdown("##### Itens — duplo clique numa célula para editar")
+
+        editado = st.data_editor(
             df_show,
             use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row",
+            disabled=["Conjunto", "Item", "Status"],
             column_config={
                 "Conjunto": st.column_config.TextColumn(width="medium"),
                 "Item": st.column_config.TextColumn(width="medium"),
-                "Meta": st.column_config.NumberColumn(width="small"),
-                "Real": st.column_config.NumberColumn(width="small"),
-                "Pago": st.column_config.NumberColumn(width="small"),
+                "Meta": st.column_config.NumberColumn(width="small", min_value=0, step=1),
+                "Real": st.column_config.NumberColumn(width="small", min_value=0, step=1),
+                "Pago": st.column_config.NumberColumn(width="small", min_value=0, step=1),
                 "Status": st.column_config.TextColumn(width="small"),
             },
-            key="tab_estoque",
+            key="editor_estoque",
+            num_rows="fixed",
             height=520,
+            on_select="rerun",
+            selection_mode="single-row",
         )
 
-        linhas_selecionadas = evento.selection.rows if evento and evento.selection else []
+        # Botão para salvar alterações feitas inline
+        c1, c2 = st.columns([1, 3])
+        salvar = c1.button("Salvar alterações", type="primary", key="btn_salvar_inline")
+
+        if salvar:
+            mudancas = 0
+            novas_hist = []
+            for _, row in editado.iterrows():
+                mask = (df["Conjunto"] == row["Conjunto"]) & (df["Item"] == row["Item"])
+                if not mask.any():
+                    continue
+                idx = df[mask].index[0]
+                for campo in ("Meta", "Real", "Pago"):
+                    novo = int(row[campo])
+                    antigo = int(df.at[idx, campo])
+                    if novo != antigo:
+                        df.at[idx, campo] = novo
+                        mudancas += 1
+                        novas_hist.append({
+                            "Data": agora(),
+                            "Conjunto": row["Conjunto"], "Item": row["Item"],
+                            "Tipo": campo.upper(), "Valor": novo - antigo,
+                            "Usuario": st.session_state["usuario"],
+                        })
+                df.at[idx, "Status"] = calcular_status(
+                    int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
+                )
+            if mudancas:
+                salvar_estoque(df)
+                registrar_no_historico(novas_hist)
+                st.success(f"{mudancas} alteração(ões) salvas.")
+                st.rerun()
+            else:
+                c2.info("Nenhuma alteração para salvar.")
+
+    # ----- DIREITA: painel do item selecionado (ações secundárias) -----
+    with col_dir:
+        linhas = editado.attrs.get("selection", {}).get("rows", []) if hasattr(editado, "attrs") else []
+        # Streamlit retorna a seleção via st.session_state ou via objeto retornado
+        sel_obj = st.session_state.get("editor_estoque", {})
+        if isinstance(sel_obj, dict):
+            linhas = sel_obj.get("selection", {}).get("rows", [])
+
         item_sel = None
-        if linhas_selecionadas:
-            row = df_show.iloc[linhas_selecionadas[0]]
+        if linhas:
+            row = df_show.iloc[linhas[0]]
             item_sel = (row["Conjunto"], row["Item"])
 
-    # ----- DIREITA: controles -----
-    with col_dir:
         if item_sel is None:
-            st.markdown("##### Selecionado")
-            st.info("Nenhum item selecionado. Clique numa linha da tabela ao lado.")
+            st.markdown("##### Ações")
+            st.info(
+                "Selecione uma linha (clique no número da linha à esquerda) para ver ações "
+                "como **Zerar Pago** e **Excluir Item**.\n\n"
+                "Para editar Meta/Real/Pago, dê duplo clique direto na célula da tabela."
+            )
         else:
             conjunto, item_nome = item_sel
             linha_atual = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].iloc[0]
 
             st.markdown(f"##### {item_nome}")
-            st.caption(f"{conjunto}  ·  Status: **{linha_atual['Status']}**")
+            st.caption(
+                f"{conjunto}  ·  Meta: **{linha_atual['Meta']}**  ·  "
+                f"Real: **{linha_atual['Real']}**  ·  Pago: **{linha_atual['Pago']}**  ·  "
+                f"Status: **{linha_atual['Status']}**"
+            )
 
-            with st.form("form_edit", clear_on_submit=False):
-                meta = st.number_input("Meta", min_value=0, value=int(linha_atual["Meta"]), step=1)
-                real = st.number_input("Real", min_value=0, value=int(linha_atual["Real"]), step=1)
-                pago = st.number_input("Pago", min_value=0, value=int(linha_atual["Pago"]), step=1)
-                col_b1, col_b2 = st.columns(2)
-                atualizar = col_b1.form_submit_button("Atualizar", type="primary")
-                zerar_pago = col_b2.form_submit_button("Zerar Pago")
-
-            if atualizar:
-                idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
-                novas_hist = []
-                for campo, novo, antigo in [
-                    ("Meta", meta, int(linha_atual["Meta"])),
-                    ("Real", real, int(linha_atual["Real"])),
-                    ("Pago", pago, int(linha_atual["Pago"])),
-                ]:
-                    if novo != antigo:
-                        df.at[idx, campo] = novo
-                        novas_hist.append({
-                            "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
-                            "Conjunto": conjunto, "Item": item_nome,
-                            "Tipo": campo.upper(), "Valor": novo - antigo,
-                            "Usuario": st.session_state["usuario"],
-                        })
-                df.at[idx, "Status"] = calcular_status(int(df.at[idx, "Meta"]), int(df.at[idx, "Real"]))
-                salvar_estoque(df)
-                if novas_hist:
-                    registrar_no_historico(novas_hist)
-                st.success("Atualizado.")
-                st.rerun()
-
-            if zerar_pago:
+            st.write("")
+            st.markdown("**Ações rápidas**")
+            if st.button("Zerar Pago", key="btn_zerar"):
                 idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
                 df.at[idx, "Pago"] = 0
                 salvar_estoque(df)
                 registrar_no_historico([{
-                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Data": agora(),
                     "Conjunto": conjunto, "Item": item_nome,
                     "Tipo": "ZERAR_PAGO", "Valor": 0,
                     "Usuario": st.session_state["usuario"],
@@ -395,19 +429,46 @@ def tela_admin_completo():
                 st.rerun()
 
             st.write("")
-            confirmar_excluir = st.checkbox("Confirmo excluir este item")
-            if st.button("Excluir Item", type="secondary", disabled=not confirmar_excluir):
+            st.markdown("**Adicionar produção**")
+            st.caption("Soma à coluna escolhida em vez de substituir.")
+            with st.form("form_add_prod"):
+                campo_add = st.selectbox("Coluna", ["Real", "Pago"])
+                valor_add = st.number_input("Quantidade a adicionar", min_value=1, value=1, step=1)
+                submeter = st.form_submit_button("Lançar", type="primary")
+            if submeter:
+                idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
+                df.at[idx, campo_add] = int(df.at[idx, campo_add]) + int(valor_add)
+                if campo_add == "Pago":
+                    # Pago também incrementa Real, igual à lógica original
+                    df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor_add)
+                df.at[idx, "Status"] = calcular_status(
+                    int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
+                )
+                salvar_estoque(df)
+                registrar_no_historico([{
+                    "Data": agora(),
+                    "Conjunto": conjunto, "Item": item_nome,
+                    "Tipo": campo_add.upper(), "Valor": int(valor_add),
+                    "Usuario": st.session_state["usuario"],
+                }])
+                st.success(f"+{valor_add} em {campo_add}.")
+                st.rerun()
+
+            st.write("")
+            st.markdown("**Zona perigosa**")
+            confirmar = st.checkbox("Confirmo excluir este item")
+            if st.button("Excluir Item", disabled=not confirmar, key="btn_excluir"):
                 df = df[~((df["Conjunto"] == conjunto) & (df["Item"] == item_nome))]
                 salvar_estoque(df)
                 registrar_no_historico([{
-                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Data": agora(),
                     "Conjunto": conjunto, "Item": item_nome,
                     "Tipo": "REMOVE_ITEM", "Valor": "-",
                     "Usuario": st.session_state["usuario"],
                 }])
                 st.rerun()
 
-    # ----- RODAPÉ: ações secundárias em expanders -----
+    # ----- RODAPÉ -----
     st.divider()
 
     with st.expander("Adicionar item"):
@@ -438,7 +499,7 @@ def tela_admin_completo():
                 df = pd.concat([df, nova], ignore_index=True)
                 salvar_estoque(df)
                 registrar_no_historico([{
-                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Data": agora(),
                     "Conjunto": conjunto_final, "Item": novo_item,
                     "Tipo": "ADD_ITEM", "Valor": int(meta_inicial),
                     "Usuario": st.session_state["usuario"],
@@ -477,8 +538,8 @@ def tela_admin_completo():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-        confirmar = c2.checkbox("Já baixei, quero zerar")
-        if st.button("Zerar planilha e iniciar nova semana", disabled=not confirmar):
+        confirmar_fechar = c2.checkbox("Já baixei, quero zerar")
+        if st.button("Zerar planilha e iniciar nova semana", disabled=not confirmar_fechar):
             fechar_semana_reset()
             st.success("Planilha zerada.")
             st.rerun()
@@ -551,17 +612,63 @@ def tela_admin_pagamento():
                 df.at[idx, "Status"] = calcular_status(
                     int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
                 )
-                # remove a coluna "Faltando" antes de salvar
                 df_save = df.drop(columns=["Faltando"], errors="ignore")
                 salvar_estoque(df_save)
                 registrar_no_historico([{
-                    "Data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                    "Data": agora(),
                     "Conjunto": conjunto, "Item": item_nome,
                     "Tipo": "PAGO", "Valor": int(valor),
                     "Usuario": st.session_state["usuario"],
                 }])
                 st.success(f"Pagamento de {valor} unidade(s) lançado.")
                 st.rerun()
+
+
+# ==================================================
+# TELA VISUALIZADOR (somente leitura)
+# ==================================================
+
+def tela_visualizador():
+    df = carregar_estoque()
+    header(df, subtitulo="Modo leitura — sem permissão de edição")
+
+    # Resumo dos itens em débito (atalho útil)
+    df_calc = df.copy()
+    df_calc["Faltando"] = df_calc["Meta"] - df_calc["Real"]
+    em_debito = df_calc[df_calc["Faltando"] > 0]
+    if not em_debito.empty:
+        st.caption(
+            f"⚠ **{len(em_debito)}** itens em débito · "
+            f"**{int(em_debito['Faltando'].sum())}** peças faltando no total"
+        )
+
+    busca = st.text_input("Buscar item", "", placeholder="Digite parte do nome...")
+
+    df_view = df.copy()
+    if busca.strip():
+        df_view = df_view[df_view["Item"].str.lower().str.contains(busca.lower())]
+
+    df_show = df_view.sort_values(["Conjunto", "Item"]).reset_index(drop=True)
+
+    st.markdown("##### Estoque")
+    st.dataframe(df_show, use_container_width=True, hide_index=True, height=520)
+
+    with st.expander("Itens em débito (apenas faltantes)"):
+        if em_debito.empty:
+            st.success("Nada em débito.")
+        else:
+            st.dataframe(
+                em_debito[["Conjunto", "Item", "Meta", "Real", "Faltando"]]
+                .sort_values(["Conjunto", "Faltando"], ascending=[True, False]),
+                use_container_width=True, hide_index=True,
+            )
+
+    with st.expander("Histórico"):
+        hist = carregar_historico()
+        if hist.empty:
+            st.write("Sem movimentações registradas.")
+        else:
+            st.dataframe(hist.iloc[::-1], use_container_width=True, hide_index=True, height=300)
 
 
 # ==================================================
@@ -595,6 +702,8 @@ def main():
         tela_admin_completo()
     elif perfil == "admin_pagamento":
         tela_admin_pagamento()
+    elif perfil == "visualizador":
+        tela_visualizador()
     else:
         st.error(f"Perfil desconhecido: {perfil}")
 
