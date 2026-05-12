@@ -567,6 +567,18 @@ def tela_admin_completo():
     with st.expander("Fechar Semana"):
         fechar_semana_form(df)
 
+    with st.expander("Resetar estoque para a estrutura padrão"):
+        st.warning(
+            "Apaga **tudo** que está na planilha do Google Sheets (estoque + histórico) "
+            "e recria do zero usando a lista de códigos padrão definida no `DADOS_PADRAO` do app. "
+            "Use quando os nomes dos itens estiverem desatualizados ou quando quiser limpar completamente."
+        )
+        confirmar_reset = st.checkbox("Sim, eu sei que vou perder todos os dados atuais")
+        if st.button("Resetar agora", disabled=not confirmar_reset, key="btn_reset"):
+            inicializar_estoque()
+            st.success("Estoque resetado para a estrutura padrão.")
+            st.rerun()
+
 
 def acoes_item(df: pd.DataFrame, rotulo_sel: str):
     """Renderiza os 3 blocos de ação para um item escolhido."""
@@ -676,35 +688,85 @@ def mostrar_historico():
 
 
 def reordenar_itens_form(df: pd.DataFrame):
-    """Permite reordenar itens dentro de cada conjunto via drag-and-drop."""
+    """Permite reordenar e mover itens entre conjuntos via drag-and-drop."""
     st.caption(
-        "Arraste os itens para reordenar dentro de cada conjunto. "
+        "Arraste os itens para reordenar dentro de um conjunto **ou mover entre conjuntos**. "
         "Depois clique em **Salvar nova ordem**."
     )
 
-    conjuntos = df["Conjunto"].unique().tolist()
-    nova_ordem_por_conjunto = {}
+    estrutura = [
+        {
+            "header": conjunto,
+            "items": df[df["Conjunto"] == conjunto]["Item"].tolist(),
+        }
+        for conjunto in df["Conjunto"].unique()
+    ]
 
-    cols = st.columns(min(len(conjuntos), 2))
-    for i, conjunto in enumerate(conjuntos):
-        with cols[i % 2]:
-            st.markdown(f"**{conjunto}**")
-            itens_atuais = df[df["Conjunto"] == conjunto]["Item"].tolist()
-            nova = sort_items(itens_atuais, key=f"sort_{conjunto}")
-            nova_ordem_por_conjunto[conjunto] = nova
+    nova_estrutura = sort_items(estrutura, multi_containers=True, key="sort_all")
 
     if st.button("Salvar nova ordem", type="primary", key="btn_salvar_ordem"):
-        # Reconstrói o df na nova ordem
-        linhas = []
-        for conjunto in conjuntos:
-            for item in nova_ordem_por_conjunto[conjunto]:
-                mask = (df["Conjunto"] == conjunto) & (df["Item"] == item)
-                if mask.any():
-                    linhas.append(df[mask].iloc[0].to_dict())
-        df_novo = pd.DataFrame(linhas)
-        salvar_estoque(df_novo)
-        st.success("Nova ordem salva.")
-        st.rerun()
+        _aplicar_reordenacao(df, nova_estrutura)
+
+
+def _aplicar_reordenacao(df_original: pd.DataFrame, nova_estrutura: list):
+    """Salva a nova distribuição/ordem, preservando Meta/Real/Pago/Status de cada linha."""
+    from collections import Counter
+
+    # 1) Detecta duplicações no destino (mesmo item duas vezes no mesmo conjunto)
+    pares_destino = [
+        (g["header"], item) for g in nova_estrutura for item in g["items"]
+    ]
+    duplicados = [p for p, c in Counter(pares_destino).items() if c > 1]
+    if duplicados:
+        st.error(
+            "Não foi possível salvar: existem itens repetidos no mesmo conjunto:\n\n"
+            + "\n".join(f"- {c}  →  {i}" for c, i in duplicados)
+        )
+        return
+
+    # 2) Pool de origens (lista de pares (Conjunto, Item) com seus valores)
+    pool = []
+    for _, row in df_original.iterrows():
+        pool.append({
+            "Conjunto": row["Conjunto"],
+            "Item": row["Item"],
+            "Meta": int(row["Meta"]),
+            "Real": int(row["Real"]),
+            "Pago": int(row["Pago"]),
+            "Status": row["Status"],
+        })
+
+    # 3) Para cada item no destino, consome o melhor candidato do pool
+    #    (prioriza item que veio do mesmo conjunto; se não, qualquer um com mesmo nome)
+    linhas_novas = []
+    for grupo in nova_estrutura:
+        conjunto_destino = grupo["header"]
+        for item in grupo["items"]:
+            # Prioridade 1: mesmo conjunto e mesmo nome
+            origem = next(
+                (p for p in pool if p["Conjunto"] == conjunto_destino and p["Item"] == item),
+                None,
+            )
+            # Prioridade 2: qualquer pool com mesmo nome (item foi movido)
+            if origem is None:
+                origem = next((p for p in pool if p["Item"] == item), None)
+            if origem is None:
+                st.error(f"Item '{item}' não foi encontrado no estoque original.")
+                return
+            pool.remove(origem)
+            linhas_novas.append({
+                "Conjunto": conjunto_destino,
+                "Item": item,
+                "Meta": origem["Meta"],
+                "Real": origem["Real"],
+                "Pago": origem["Pago"],
+                "Status": origem["Status"],
+            })
+
+    df_novo = pd.DataFrame(linhas_novas)
+    salvar_estoque(df_novo)
+    st.success("Nova ordem salva.")
+    st.rerun()
 
 
 def fechar_semana_form(df: pd.DataFrame):
