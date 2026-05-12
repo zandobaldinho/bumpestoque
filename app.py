@@ -15,6 +15,7 @@ import hashlib
 import io
 import gspread
 from google.oauth2.service_account import Credentials
+from streamlit_sortables import sort_items
 
 
 # ==================================================
@@ -42,6 +43,11 @@ USUARIOS = {
         "perfil": "admin_pagamento",
         "nome": "Abner",
     },
+    "producao": {
+        "senha_hash": "a074805448d1baef3240d5b2856df7345380cb875e9b1c46b27b3f4ed8a7ca32",
+        "perfil": "produtor",
+        "nome": "Produção",
+    },
     "wagnerbender": {
         "senha_hash": "7e5e2e43c4eb7ab30d26677b8b4132f4ca74d154439489db5a46b477681387f3",
         "perfil": "visualizador",
@@ -51,18 +57,39 @@ USUARIOS = {
 
 DADOS_PADRAO = {
     "Conjunto Tampa Guia": [
-        "Tampa guia", "Gaxeta", "Tampa pó", "Anel grafitado", "O-ring",
+        "TMG-001",
+        "GXT-001",
+        "TMÓ-001",
+        "NLG-020",
+        "RNG-001",
     ],
     "Conjunto Tampa Gás": [
-        "Tampa gás", "Valvula TR4", "Arruela TR4", "Núcleo TR4", "Porca TR4", "O-ring",
+        "TMÁ-001",
+        "VLT-004",
+        "ART-004",
+        "NCL-004",
+        "PRC-004",
+        "RNG-001",
+        # "TMT-004",  # do PDF, pendente — descomentar se for daqui
     ],
     "Conjunto Embolo": [
-        "Embolo", "Backup", "Viton",
+        "MBL-001",
+        "BCK-001",
+        "VTN-001",
     ],
     "Conjunto Diversos": [
-        "Arruela Pressão", "Anel elástico", "Batente", "Chapéu chinês",
-        "Mola P", "Mola G", "Porca",
-        "Válvula de 1 furo", "Válvula de 3 furo", "Válvula de 2 furo", "Válvula guia",
+        "RLP-001",
+        "NLL-001",
+        "BTH-001",
+        "RLC-001",
+        "RLM-001",
+        "RLM-002",
+        "PRC-012",
+        "VLV-001",
+        "VLV-002",
+        "VLV-003",
+        "VLA-001",
+        # "TFL-001",  # do PDF, pendente — descomentar se for daqui
     ],
 }
 
@@ -319,6 +346,163 @@ def parse_rotulo(rotulo: str):
 
 
 # ==================================================
+# HISTÓRICO DE PAGAMENTOS POR ITEM
+# ==================================================
+
+def historico_pagamentos_item(conjunto: str, item_nome: str) -> pd.DataFrame:
+    """Retorna apenas os pagamentos (Tipo=PAGO) feitos no item escolhido."""
+    return _historico_item_por_tipo(conjunto, item_nome, "PAGO")
+
+
+def historico_producao_item(conjunto: str, item_nome: str) -> pd.DataFrame:
+    """Retorna apenas os lançamentos de produção (Tipo=REAL) do item escolhido."""
+    return _historico_item_por_tipo(conjunto, item_nome, "REAL")
+
+
+def _historico_item_por_tipo(conjunto: str, item_nome: str, tipo: str) -> pd.DataFrame:
+    hist = carregar_historico()
+    if hist.empty:
+        return pd.DataFrame(columns=["Data", "Valor", "Usuario"])
+    filtrado = hist[
+        (hist["Conjunto"] == conjunto)
+        & (hist["Item"] == item_nome)
+        & (hist["Tipo"] == tipo)
+    ].copy()
+    if filtrado.empty:
+        return pd.DataFrame(columns=["Data", "Valor", "Usuario"])
+    return filtrado[["Data", "Valor", "Usuario"]].iloc[::-1].reset_index(drop=True)
+
+
+# ==================================================
+# DIÁLOGOS DE CONFIRMAÇÃO (popups)
+# ==================================================
+
+@st.dialog("Confirmar alterações")
+def dialog_confirmar_edicao(df_original: pd.DataFrame, editado: pd.DataFrame):
+    """Mostra resumo das alterações inline antes de salvar."""
+    mudancas = []
+    for _, row in editado.iterrows():
+        mask = (df_original["Conjunto"] == row["Conjunto"]) & (df_original["Item"] == row["Item"])
+        if not mask.any():
+            continue
+        orig = df_original[mask].iloc[0]
+        for campo in ("Meta", "Real", "Pago"):
+            antigo = int(orig[campo])
+            novo = int(row[campo])
+            if antigo != novo:
+                mudancas.append({
+                    "Item": row["Item"],
+                    "Campo": campo,
+                    "De": antigo,
+                    "Para": novo,
+                    "Diferença": novo - antigo,
+                })
+
+    if not mudancas:
+        st.info("Nenhuma alteração detectada.")
+        if st.button("Fechar", use_container_width=True):
+            st.rerun()
+        return
+
+    st.write(f"Você está prestes a aplicar **{len(mudancas)}** alteração(ões):")
+    st.dataframe(pd.DataFrame(mudancas), use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    if c1.button("Confirmar e salvar", type="primary", use_container_width=True, key="dlg_edit_ok"):
+        _aplicar_edicoes(df_original, editado, mudancas)
+    if c2.button("Cancelar", use_container_width=True, key="dlg_edit_cancel"):
+        st.rerun()
+
+
+def _aplicar_edicoes(df_original: pd.DataFrame, editado: pd.DataFrame, mudancas: list):
+    """Executa de fato as edições aprovadas no diálogo."""
+    df_novo = df_original.copy()
+    novas_hist = []
+    for _, row in editado.iterrows():
+        mask = (df_novo["Conjunto"] == row["Conjunto"]) & (df_novo["Item"] == row["Item"])
+        if not mask.any():
+            continue
+        idx = df_novo[mask].index[0]
+        for campo in ("Meta", "Real", "Pago"):
+            novo = int(row[campo])
+            antigo = int(df_novo.at[idx, campo])
+            if novo != antigo:
+                df_novo.at[idx, campo] = novo
+                novas_hist.append({
+                    "Data": agora(),
+                    "Conjunto": row["Conjunto"], "Item": row["Item"],
+                    "Tipo": campo.upper(), "Valor": novo - antigo,
+                    "Usuario": usuario_atual(),
+                })
+        df_novo.at[idx, "Status"] = calcular_status(
+            int(df_novo.at[idx, "Meta"]), int(df_novo.at[idx, "Real"])
+        )
+    salvar_estoque(df_novo)
+    registrar_no_historico(novas_hist)
+    st.success(f"{len(mudancas)} alteração(ões) aplicadas.")
+    st.rerun()
+
+
+@st.dialog("Confirmar pagamento")
+def dialog_confirmar_pagamento(conjunto: str, item_nome: str, valor: int, df: pd.DataFrame):
+    """Mostra resumo antes de lançar o pagamento."""
+    mask = (df["Conjunto"] == conjunto) & (df["Item"] == item_nome)
+    if not mask.any():
+        st.error("Item não encontrado.")
+        return
+    linha = df[mask].iloc[0]
+    meta = int(linha["Meta"])
+    real = int(linha["Real"])
+    pago_atual = int(linha["Pago"])
+    falta_antes = meta - real
+    falta_depois = falta_antes - valor
+
+    st.markdown(f"**Item:** {item_nome}")
+    st.caption(f"{conjunto}")
+    st.write("")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pagamento agora", valor)
+    c2.metric("Faltava", falta_antes)
+    c3.metric("Faltará depois", max(falta_depois, 0))
+
+    st.caption(
+        f"Pago acumulado passará de **{pago_atual}** para **{pago_atual + valor}**.  \n"
+        f"Real (produzido) passará de **{real}** para **{real + valor}**."
+    )
+
+    if falta_depois < 0:
+        st.warning(
+            f"Esse pagamento vai gerar excedente de {abs(falta_depois)} unidade(s) acima da meta."
+        )
+
+    c1, c2 = st.columns(2)
+    if c1.button("Confirmar pagamento", type="primary", use_container_width=True, key="dlg_pag_ok"):
+        _aplicar_pagamento(df, conjunto, item_nome, valor)
+    if c2.button("Cancelar", use_container_width=True, key="dlg_pag_cancel"):
+        st.rerun()
+
+
+def _aplicar_pagamento(df: pd.DataFrame, conjunto: str, item_nome: str, valor: int):
+    idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
+    df.at[idx, "Pago"] = int(df.at[idx, "Pago"]) + int(valor)
+    df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor)
+    df.at[idx, "Status"] = calcular_status(
+        int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
+    )
+    df_save = df.drop(columns=["Faltando"], errors="ignore")
+    salvar_estoque(df_save)
+    registrar_no_historico([{
+        "Data": agora(),
+        "Conjunto": conjunto, "Item": item_nome,
+        "Tipo": "PAGO", "Valor": int(valor),
+        "Usuario": usuario_atual(),
+    }])
+    st.success(f"Pagamento de {valor} unidade(s) lançado.")
+    st.rerun()
+
+
+# ==================================================
 # TELA ADMIN COMPLETO
 # ==================================================
 
@@ -327,7 +511,7 @@ def tela_admin_completo():
     header(df)
 
     busca = st.text_input("Buscar item", "", placeholder="Digite parte do nome...")
-    df_view = aplicar_busca(df, busca).sort_values(["Conjunto", "Item"]).reset_index(drop=True)
+    df_view = aplicar_busca(df, busca).reset_index(drop=True)
 
     # ============ Tabela editável (edição inline) ============
     st.markdown("##### Itens — duplo clique numa célula de Meta/Real/Pago para editar")
@@ -335,13 +519,13 @@ def tela_admin_completo():
     editado = st.data_editor(
         df_view,
         use_container_width=True, hide_index=True,
-        disabled=["Conjunto", "Item", "Status"],
+        disabled=["Conjunto", "Item", "Status", "Pago"],
         column_config={
             "Conjunto": st.column_config.TextColumn(width="medium"),
             "Item": st.column_config.TextColumn(width="medium"),
             "Meta": st.column_config.NumberColumn(width="small", min_value=0, step=1),
             "Real": st.column_config.NumberColumn(width="small", min_value=0, step=1),
-            "Pago": st.column_config.NumberColumn(width="small", min_value=0, step=1),
+            "Pago": st.column_config.NumberColumn(width="small", help="Apenas o perfil Pagamento pode alterar"),
             "Status": st.column_config.TextColumn(width="small"),
         },
         num_rows="fixed",
@@ -351,7 +535,7 @@ def tela_admin_completo():
 
     c1, c2 = st.columns([1, 4])
     if c1.button("Salvar alterações", type="primary", key="btn_salvar_edicoes"):
-        salvar_edicoes_inline(df, editado)
+        dialog_confirmar_edicao(df, editado)
 
     st.divider()
 
@@ -359,7 +543,7 @@ def tela_admin_completo():
     st.markdown("##### Ações em um item específico")
     st.caption("Para zerar pago, somar produção (incremental) ou excluir item.")
 
-    rotulos = [rotulo_item(r["Conjunto"], r["Item"]) for _, r in df.sort_values(["Conjunto", "Item"]).iterrows()]
+    rotulos = [rotulo_item(r["Conjunto"], r["Item"]) for _, r in df.iterrows()]
     rotulo_sel = st.selectbox(
         "Escolha o item", [""] + rotulos, key="sel_acoes",
         format_func=lambda x: "— selecione —" if x == "" else x,
@@ -374,48 +558,14 @@ def tela_admin_completo():
     with st.expander("Adicionar item"):
         adicionar_item_form(df)
 
+    with st.expander("Reordenar itens (arraste para mudar a ordem)"):
+        reordenar_itens_form(df)
+
     with st.expander("Histórico"):
         mostrar_historico()
 
     with st.expander("Fechar Semana"):
         fechar_semana_form(df)
-
-
-def salvar_edicoes_inline(df_original: pd.DataFrame, editado: pd.DataFrame):
-    """Detecta mudanças entre df_original e editado, persiste, registra histórico."""
-    mudancas = 0
-    novas_hist = []
-    df_novo = df_original.copy()
-
-    for _, row in editado.iterrows():
-        mask = (df_novo["Conjunto"] == row["Conjunto"]) & (df_novo["Item"] == row["Item"])
-        if not mask.any():
-            continue
-        idx = df_novo[mask].index[0]
-        for campo in ("Meta", "Real", "Pago"):
-            novo = int(row[campo])
-            antigo = int(df_novo.at[idx, campo])
-            if novo != antigo:
-                df_novo.at[idx, campo] = novo
-                mudancas += 1
-                novas_hist.append({
-                    "Data": agora(),
-                    "Conjunto": row["Conjunto"], "Item": row["Item"],
-                    "Tipo": campo.upper(), "Valor": novo - antigo,
-                    "Usuario": usuario_atual(),
-                })
-        df_novo.at[idx, "Status"] = calcular_status(
-            int(df_novo.at[idx, "Meta"]), int(df_novo.at[idx, "Real"])
-        )
-
-    if mudancas == 0:
-        st.info("Nenhuma alteração para salvar.")
-        return
-
-    salvar_estoque(df_novo)
-    registrar_no_historico(novas_hist)
-    st.success(f"{mudancas} alteração(ões) salvas.")
-    st.rerun()
 
 
 def acoes_item(df: pd.DataFrame, rotulo_sel: str):
@@ -435,34 +585,18 @@ def acoes_item(df: pd.DataFrame, rotulo_sel: str):
         f"Real: **{linha['Real']}** · Pago: **{linha['Pago']}** · Status: **{linha['Status']}**"
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
 
-    # ----- Zerar Pago -----
+    # ----- Somar produção (incremental, só Real) -----
     with col1:
-        st.markdown("**Zerar Pago**")
-        if st.button("Zerar pago deste item", key="btn_zerar_pago"):
-            df.at[idx, "Pago"] = 0
-            salvar_estoque(df)
-            registrar_no_historico([{
-                "Data": agora(),
-                "Conjunto": conjunto, "Item": item_nome,
-                "Tipo": "ZERAR_PAGO", "Valor": 0,
-                "Usuario": usuario_atual(),
-            }])
-            st.rerun()
-
-    # ----- Somar produção (incremental) -----
-    with col2:
-        st.markdown("**Somar produção**")
+        st.markdown("**Somar produção (Real)**")
+        st.caption("Adiciona unidades produzidas ao Real do item.")
         with st.form("form_somar"):
-            campo_add = st.selectbox("Coluna", ["Real", "Pago"])
             valor_add = st.number_input("Quantidade", min_value=1, value=1, step=1)
             submit = st.form_submit_button("Lançar")
         if submit:
-            df.at[idx, campo_add] = int(df.at[idx, campo_add]) + int(valor_add)
-            if campo_add == "Pago":
-                # Pago também incrementa Real (mesma lógica do tkinter original)
-                df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor_add)
+            idx = df[mask].index[0]
+            df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor_add)
             df.at[idx, "Status"] = calcular_status(
                 int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
             )
@@ -470,15 +604,16 @@ def acoes_item(df: pd.DataFrame, rotulo_sel: str):
             registrar_no_historico([{
                 "Data": agora(),
                 "Conjunto": conjunto, "Item": item_nome,
-                "Tipo": campo_add.upper(), "Valor": int(valor_add),
+                "Tipo": "REAL", "Valor": int(valor_add),
                 "Usuario": usuario_atual(),
             }])
-            st.success(f"+{valor_add} em {campo_add}.")
+            st.success(f"+{valor_add} em Real.")
             st.rerun()
 
     # ----- Excluir item -----
-    with col3:
+    with col2:
         st.markdown("**Excluir item**")
+        st.caption("Remove o item da planilha permanentemente.")
         confirmar = st.checkbox("Confirmo excluir", key="cb_excluir")
         if st.button("Excluir", disabled=not confirmar, key="btn_excluir"):
             df_novo = df[~mask]
@@ -538,6 +673,38 @@ def mostrar_historico():
         st.write("Sem movimentações registradas.")
     else:
         st.dataframe(hist.iloc[::-1], use_container_width=True, hide_index=True, height=300)
+
+
+def reordenar_itens_form(df: pd.DataFrame):
+    """Permite reordenar itens dentro de cada conjunto via drag-and-drop."""
+    st.caption(
+        "Arraste os itens para reordenar dentro de cada conjunto. "
+        "Depois clique em **Salvar nova ordem**."
+    )
+
+    conjuntos = df["Conjunto"].unique().tolist()
+    nova_ordem_por_conjunto = {}
+
+    cols = st.columns(min(len(conjuntos), 2))
+    for i, conjunto in enumerate(conjuntos):
+        with cols[i % 2]:
+            st.markdown(f"**{conjunto}**")
+            itens_atuais = df[df["Conjunto"] == conjunto]["Item"].tolist()
+            nova = sort_items(itens_atuais, key=f"sort_{conjunto}")
+            nova_ordem_por_conjunto[conjunto] = nova
+
+    if st.button("Salvar nova ordem", type="primary", key="btn_salvar_ordem"):
+        # Reconstrói o df na nova ordem
+        linhas = []
+        for conjunto in conjuntos:
+            for item in nova_ordem_por_conjunto[conjunto]:
+                mask = (df["Conjunto"] == conjunto) & (df["Item"] == item)
+                if mask.any():
+                    linhas.append(df[mask].iloc[0].to_dict())
+        df_novo = pd.DataFrame(linhas)
+        salvar_estoque(df_novo)
+        st.success("Nova ordem salva.")
+        st.rerun()
 
 
 def fechar_semana_form(df: pd.DataFrame):
@@ -619,40 +786,171 @@ def tela_admin_pagamento():
             return
 
         conjunto, item_nome = item_sel
-        linha = em_debito[
-            (em_debito["Conjunto"] == conjunto) & (em_debito["Item"] == item_nome)
+        linha_estoque = df[
+            (df["Conjunto"] == conjunto) & (df["Item"] == item_nome)
         ].iloc[0]
-        faltando = int(linha["Faltando"])
+        meta = int(linha_estoque["Meta"])
+        real = int(linha_estoque["Real"])
+        pago_acumulado = int(linha_estoque["Pago"])
+        faltando = meta - real
 
         st.markdown(f"##### {item_nome}")
-        st.caption(f"{conjunto}  ·  Faltam: **{faltando}**")
+        st.caption(f"{conjunto}")
 
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Meta", meta)
+        c2.metric("Já pago", pago_acumulado)
+        c3.metric("Falta pagar", max(faltando, 0))
+
+        # Histórico de pagamentos deste item
+        pagos_item = historico_pagamentos_item(conjunto, item_nome)
+        if not pagos_item.empty:
+            st.caption(f"**Pagamentos anteriores ({len(pagos_item)}):**")
+            st.dataframe(pagos_item, use_container_width=True, hide_index=True, height=180)
+        else:
+            st.caption("Sem pagamentos anteriores registrados.")
+
+        st.write("")
         with st.form("form_pag"):
             valor = st.number_input(
-                "Quantidade paga agora",
+                "Quantidade a pagar agora",
                 min_value=1, max_value=99999, value=min(faltando, 1) or 1, step=1,
             )
             enviar = st.form_submit_button("Lançar pagamento", type="primary")
 
-        if not enviar:
+        if enviar:
+            dialog_confirmar_pagamento(conjunto, item_nome, int(valor), df)
+
+
+@st.dialog("Confirmar lançamento de produção")
+def dialog_confirmar_producao(conjunto: str, item_nome: str, valor: int, df: pd.DataFrame):
+    """Mostra resumo antes de lançar produção (somar no Real)."""
+    mask = (df["Conjunto"] == conjunto) & (df["Item"] == item_nome)
+    if not mask.any():
+        st.error("Item não encontrado.")
+        return
+    linha = df[mask].iloc[0]
+    meta = int(linha["Meta"])
+    real = int(linha["Real"])
+    falta_antes = meta - real
+    falta_depois = falta_antes - valor
+
+    st.markdown(f"**Item:** {item_nome}")
+    st.caption(f"{conjunto}")
+    st.write("")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Produção agora", valor)
+    c2.metric("Faltava", max(falta_antes, 0))
+    c3.metric("Faltará depois", max(falta_depois, 0))
+
+    st.caption(
+        f"Real (produzido) passará de **{real}** para **{real + valor}**.  \n"
+        f"Meta continua **{meta}**."
+    )
+
+    if falta_depois < 0:
+        st.warning(
+            f"Esse lançamento vai gerar excedente de {abs(falta_depois)} unidade(s) acima da meta."
+        )
+
+    c1, c2 = st.columns(2)
+    if c1.button("Confirmar lançamento", type="primary", use_container_width=True, key="dlg_prod_ok"):
+        _aplicar_producao(df, conjunto, item_nome, valor)
+    if c2.button("Cancelar", use_container_width=True, key="dlg_prod_cancel"):
+        st.rerun()
+
+
+def _aplicar_producao(df: pd.DataFrame, conjunto: str, item_nome: str, valor: int):
+    idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
+    df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor)
+    df.at[idx, "Status"] = calcular_status(
+        int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
+    )
+    df_save = df.drop(columns=["Faltando"], errors="ignore")
+    salvar_estoque(df_save)
+    registrar_no_historico([{
+        "Data": agora(),
+        "Conjunto": conjunto, "Item": item_nome,
+        "Tipo": "REAL", "Valor": int(valor),
+        "Usuario": usuario_atual(),
+    }])
+    st.success(f"Lançamento de {valor} unidade(s) registrado.")
+    st.rerun()
+
+
+# ==================================================
+# TELA PRODUTOR (só altera Real)
+# ==================================================
+
+def tela_produtor():
+    df = carregar_estoque()
+    df["Faltando"] = df["Meta"] - df["Real"]
+
+    header(df, subtitulo="Lançamento de produção — apenas Real")
+
+    busca = st.text_input("Buscar item", "", placeholder="Digite parte do nome...")
+    df_view = aplicar_busca(df, busca).reset_index(drop=True)
+
+    col_esq, col_dir = st.columns([2, 1])
+
+    with col_esq:
+        st.markdown("##### Itens — clique numa linha para selecionar")
+        df_show = df_view[["Conjunto", "Item", "Meta", "Real", "Faltando", "Status"]].reset_index(drop=True)
+
+        evento = st.dataframe(
+            df_show,
+            use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row",
+            key="tab_producao",
+            height=500,
+        )
+        linhas = evento.selection.rows if evento and evento.selection else []
+        item_sel = None
+        if linhas:
+            row = df_show.iloc[linhas[0]]
+            item_sel = (row["Conjunto"], row["Item"])
+
+    with col_dir:
+        if item_sel is None:
+            st.markdown("##### Lançar produção")
+            st.info("Selecione um item na tabela ao lado.")
             return
 
-        idx = df[(df["Conjunto"] == conjunto) & (df["Item"] == item_nome)].index[0]
-        df.at[idx, "Pago"] = int(df.at[idx, "Pago"]) + int(valor)
-        df.at[idx, "Real"] = int(df.at[idx, "Real"]) + int(valor)
-        df.at[idx, "Status"] = calcular_status(
-            int(df.at[idx, "Meta"]), int(df.at[idx, "Real"])
-        )
-        df_save = df.drop(columns=["Faltando"], errors="ignore")
-        salvar_estoque(df_save)
-        registrar_no_historico([{
-            "Data": agora(),
-            "Conjunto": conjunto, "Item": item_nome,
-            "Tipo": "PAGO", "Valor": int(valor),
-            "Usuario": usuario_atual(),
-        }])
-        st.success(f"Pagamento de {valor} unidade(s) lançado.")
-        st.rerun()
+        conjunto, item_nome = item_sel
+        linha_estoque = df[
+            (df["Conjunto"] == conjunto) & (df["Item"] == item_nome)
+        ].iloc[0]
+        meta = int(linha_estoque["Meta"])
+        real = int(linha_estoque["Real"])
+        faltando = meta - real
+
+        st.markdown(f"##### {item_nome}")
+        st.caption(f"{conjunto}")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Meta", meta)
+        c2.metric("Produzido", real)
+        c3.metric("Falta", max(faltando, 0))
+
+        # Histórico de lançamentos deste item
+        prods_item = historico_producao_item(conjunto, item_nome)
+        if not prods_item.empty:
+            st.caption(f"**Lançamentos anteriores ({len(prods_item)}):**")
+            st.dataframe(prods_item, use_container_width=True, hide_index=True, height=180)
+        else:
+            st.caption("Sem lançamentos anteriores registrados.")
+
+        st.write("")
+        with st.form("form_prod"):
+            valor = st.number_input(
+                "Quantidade produzida agora",
+                min_value=1, max_value=99999, value=min(max(faltando, 1), 999), step=1,
+            )
+            enviar = st.form_submit_button("Lançar produção", type="primary")
+
+        if enviar:
+            dialog_confirmar_producao(conjunto, item_nome, int(valor), df)
 
 
 # ==================================================
@@ -722,6 +1020,8 @@ def main():
         tela_admin_completo()
     elif perfil == "admin_pagamento":
         tela_admin_pagamento()
+    elif perfil == "produtor":
+        tela_produtor()
     elif perfil == "visualizador":
         tela_visualizador()
     else:
